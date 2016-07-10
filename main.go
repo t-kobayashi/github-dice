@@ -2,30 +2,27 @@ package main
 
 import (
 	"fmt"
-	"log"
-	"os"
-
 	"github.com/google/go-github/github"
 	"github.com/jessevdk/go-flags"
 	"github.com/joho/godotenv"
-	"golang.org/x/oauth2"
+	//"github.com/k0kubun/pp"
+	"log"
+	"math/rand"
+	"os"
+	"strings"
+	"time"
 )
 
 type Dice struct {
 	Opts Options
-
-	githubToken        string
-	githubOrganization string
-	githubTeam         string
-	githubRepo         string
 }
 
 type Options struct {
-	Query   string `short:"q" long:"query" default:"is:issue" description:"query strings for search issue/pull-request."`
-	DryRun  bool   `short:"n" long:"dry-run" description:"show candidates and list issues, without assign."`
-	Force   bool   `short:"f" long:"force" description:"if true, reassign even if already assigned."`
-	RunOnce bool   `short:"o" long:"run-once" description:"if true, assign just once issue."`
-	Debug   bool   `short:"d" long:"debug"`
+	DryRun  bool `short:"n" long:"dry-run" description:"show candidates and list issues, without assign."`
+	Force   bool `short:"f" long:"force" description:"if true, reassign even if already assigned."`
+	RunOnce bool `short:"o" long:"run-once" description:"if true, assign just once issue."`
+	Debug   bool `short:"d" long:"debug"`
+	Limit   int  `short:"l" long:"limit" default:"0" description:"maximum number of issues per running command."`
 }
 
 func (d *Dice) initialize(args []string) {
@@ -37,76 +34,57 @@ func (d *Dice) initialize(args []string) {
 	if err != nil {
 		os.Exit(1)
 	}
-
-	d.githubToken = os.Getenv("GITHUB_ACCESS_TOKEN")
-	d.githubOrganization = os.Getenv("GITHUB_ORGANIZATION")
-	d.githubTeam = os.Getenv("GITHUB_TEAM")
-	d.githubRepo = os.Getenv("GITHUB_REPO")
 }
 
 func (d *Dice) run() {
-	ts := oauth2.StaticTokenSource(
-		&oauth2.Token{AccessToken: d.githubToken},
-	)
-	tc := oauth2.NewClient(oauth2.NoContext, ts)
-	client := github.NewClient(tc)
+	p := NewPullRequestManager(d.Opts.DryRun)
 
-	t, _, err := client.Organizations.ListTeams(d.githubOrganization, &github.ListOptions{PerPage: 100})
+	pullRequests, err := p.FindPullRequests("open")
 	if err != nil {
-		d.log("List teams failed.")
 		d.log(err.Error())
 		os.Exit(1)
 	}
 
-	tt := findTeamByName(d.githubTeam, t)
-
-	members, _, err := client.Organizations.ListTeamMembers(*tt.ID, &github.OrganizationListTeamMembersOptions{})
-	if err != nil {
-		d.log("List team members failed.")
-		d.log(err.Error())
-		os.Exit(1)
-	}
-	if members == nil {
-		d.log("No body in this team.")
-		os.Exit(2)
-	}
-	d.log("Candidates are " + joinUsers(members))
-
-	addQuery := d.Opts.Query
-	q := "repo:%s/%s " + addQuery
-	r, _, err := client.Search.Issues(fmt.Sprintf(q, d.githubOrganization, d.githubRepo), &github.SearchOptions{})
-	if err != nil {
-		d.log("Search issue failed.")
-		os.Exit(1)
-	}
-	if r == nil {
-		d.log("No issue matched.")
-		os.Exit(2)
-	}
-
-	for _, i := range r.Issues {
-		if !d.Opts.Force && i.Assignee != nil {
-			d.log(fmt.Sprintf("Skip already assigned isssue #%d (%s) ", *i.Number, *i.Title))
+	var candidates []*github.User
+	assinedNumber := 0
+	for _, pr := range pullRequests {
+		p.AssignAuthor(pr)
+		if p.IsAlreadyAssignedExpectAuthor(pr) {
 			continue
 		}
-
-		u := selectMember(members)
-
-		if !d.Opts.DryRun {
-			client.Issues.Edit(d.githubOrganization, d.githubRepo, *i.Number, &github.IssueRequest{Assignee: u.Login})
+		candidates, err = p.FindCandidatesOfReviewer(pr)
+		if err != nil {
+			d.log(err.Error())
+			os.Exit(1)
 		}
-
-		dryrun := ""
-		if d.Opts.DryRun {
-			dryrun = "(dryrun) "
-		}
-
-		d.log(fmt.Sprintf("%sAssigned %s on #%d (%s)", dryrun, *u.Login, *i.Number, *i.Title))
-
-		if d.Opts.RunOnce {
+		assignee := d.throw(candidates)
+		p.AssignUser(pr, assignee)
+		p.Comment(pr, ":game_die: @"+*assignee.Login)
+		d.log(fmt.Sprintf("#%d %s => author:%s assigned:%s", *pr.Number, *pr.Title, *pr.User.Login, *assignee.Login))
+		assinedNumber++
+		if d.Opts.Limit > 0 && d.Opts.Limit <= assinedNumber {
 			break
 		}
 	}
+}
+
+func (d *Dice) throw(candidates []*github.User) *github.User {
+	exemptions := os.Getenv("DICE_EXEMPTIONS")
+
+	var act []*github.User
+Loop:
+	for _, c := range candidates {
+		for _, ex := range strings.Split(exemptions, ",") {
+			if ex == *c.Login {
+				continue Loop
+			}
+		}
+		act = append(act, c)
+	}
+	rand.Seed(time.Now().UnixNano())
+	i := rand.Intn(len(act))
+
+	return act[i]
 }
 
 func (d *Dice) log(str string) {
