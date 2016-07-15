@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"github.com/google/go-github/github"
+	"golang.org/x/oauth2"
 	"regexp"
 	"strings"
 )
@@ -17,18 +18,21 @@ type IssueManager struct {
 
 type Users []*github.User
 
-func NewIssueManager(client *github.Client, organization string, repository string, team string, dryRun bool) *IssueManager {
+func NewIssueManager(organization string, repository string, team string, token string, dryRun bool) *IssueManager {
+
+	tc := oauth2.NewClient(oauth2.NoContext, oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token}))
+
 	im := &IssueManager{}
-	im.Client = client
+	im.Client = github.NewClient(tc)
 	im.Organization = organization
 	im.Repository = repository
-	im.DryRun = dryRun
 	im.Team = team
+	im.DryRun = dryRun
 
 	return im
 }
 
-func (im *IssueManager) FindIssues(spec string) ([]github.Issue, error) {
+func (im *IssueManager) FindIssues(spec string) ([]*github.Issue, error) {
 	members, err := im.findUsersByTeamName(im.Team)
 	if err != nil {
 		return nil, err
@@ -39,12 +43,12 @@ func (im *IssueManager) FindIssues(spec string) ([]github.Issue, error) {
 		return nil, err
 	}
 
-	var targets []github.Issue
+	var targets []*github.Issue
 Loop:
-	for _, issue := range searchResult.Issues {
+	for i, issue := range searchResult.Issues {
 		for _, member := range members {
 			if *issue.User.Login == *member.Login {
-				targets = append(targets, issue)
+				targets = append(targets, &searchResult.Issues[i])
 				continue Loop
 			}
 		}
@@ -53,39 +57,50 @@ Loop:
 	return targets, nil
 }
 
-func (im *IssueManager) FindCandidatesOfReviewer(issue *github.Issue) ([]*github.User, error) {
+func (im *IssueManager) FindCandidatesOfReviewers(issue *github.Issue) ([]string, error) {
 	var users Users
 	users, err := im.findUsersByTeamName(im.Team)
 	if err != nil {
 		return nil, err
 	}
-	candidates := users.removeUser(issue.User)
+	candidates := Users(users.removeUser(issue.User))
 
-	return candidates, nil
+	return candidates.GetLoginNames(), nil
 }
 
-func (im *IssueManager) AssignUser(issue *github.Issue, user *github.User) bool {
+func (im *IssueManager) Assign(issue *github.Issue, assignee string, assignAuthor bool) (*github.Issue, error) {
+	assignees := []string{assignee}
+	if assignAuthor {
+		assignees = append(assignees, *issue.User.Login)
+	}
 	if im.DryRun {
-		return true
+		return issue, nil
 	}
-	asignees := []string{*user.Login}
-	_, _, err := im.Client.Issues.AddAssignees(im.Organization, im.Repository, *issue.Number, asignees)
-	if err != nil {
-		return false
-	}
-	return true
-}
+	i, _, err := im.Client.Issues.AddAssignees(im.Organization, im.Repository, *issue.Number, assignees)
 
-func (im *IssueManager) AssignAuthor(issue *github.Issue) bool {
-	return im.AssignUser(issue, issue.User)
+	return i, err
 }
 
 func (im *IssueManager) IsAlreadyAssignedExpectAuthor(issue *github.Issue) bool {
+	assignUsersExpectAuthor := im.getAssignUsersExpectAuthor(issue)
+
+	return len(assignUsersExpectAuthor) > 0
+}
+
+func (im *IssueManager) UnassignUsersExpectAuthor(issue *github.Issue) (*github.Issue, error) {
+	users := im.getAssignUsersExpectAuthor(issue)
+	var asignees []string
+	for _, u := range users {
+		asignees = append(asignees, *u.Login)
+	}
+	i, _, err := im.Client.Issues.RemoveAssignees(im.Organization, im.Repository, *issue.Number, asignees)
+	return i, err
+}
+
+func (im *IssueManager) getAssignUsersExpectAuthor(issue *github.Issue) []*github.User {
 	var assignees Users
 	assignees = issue.Assignees
-	assineesExpectAuthor := assignees.removeUser(issue.User)
-
-	return len(assineesExpectAuthor) > 0
+	return assignees.removeUser(issue.User)
 }
 
 func (im *IssueManager) Comment(issue *github.Issue, comment string) bool {
@@ -124,8 +139,18 @@ func (users Users) removeUser(user *github.User) []*github.User {
 	return candidates
 }
 
+func (users Users) GetLoginNames() []string {
+	var names []string
+	for _, u := range users {
+		names = append(names, *u.Login)
+	}
+
+	return names
+}
+
 func (im *IssueManager) buildQuery(spec string) string {
 	queries := regexp.MustCompile(" +").Split(spec, -1)
 	queries = append(queries, "repo:"+im.Organization+"/"+im.Repository)
+
 	return strings.Join(queries, " ")
 }
